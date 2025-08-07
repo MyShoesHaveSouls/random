@@ -1,16 +1,23 @@
 import os
 import sys
 import time
-import secrets
+import numpy as np
 from eth_keys import keys
 from eth_keys.exceptions import ValidationError
 from pybloom_live import BloomFilter
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 
 RICHLIST_FILE = 'richlist.txt'
+MATCHES_FILE = 'matches.txt'
+CHUNK_SIZE = 10000  # Now 10,000 per worker
 
-def generate_random_private_key():
-    return secrets.randbits(256)
+def generate_random_keys_numpy(n):
+    # Generate `n` random 256-bit integers using NumPy
+    return np.random.randint(0, 2**256, dtype=np.uint64, size=(n, 4))
+
+def uint256_from_chunks(chunks):
+    # Combine 4x uint64 values into one 256-bit integer
+    return (int(chunks[0]) << 192) | (int(chunks[1]) << 128) | (int(chunks[2]) << 64) | int(chunks[3])
 
 def private_key_to_address(private_key_int):
     try:
@@ -22,11 +29,18 @@ def private_key_to_address(private_key_int):
 
 def worker(args):
     bloom, richlist_set = args
-    private_key_int = generate_random_private_key()
-    address = private_key_to_address(private_key_int)
-    if address and address in bloom and address in richlist_set:
-        return private_key_int, address
-    return None
+    matches = []
+    key_chunks = generate_random_keys_numpy(CHUNK_SIZE)
+    for chunk in key_chunks:
+        priv_key_int = uint256_from_chunks(chunk)
+        address = private_key_to_address(priv_key_int)
+        if address and address in bloom and address in richlist_set:
+            matches.append((priv_key_int, address))
+    return matches
+
+def log_match_to_file(priv_key_int, address):
+    with open(MATCHES_FILE, 'a') as f:
+        f.write(f"Private Key: {priv_key_int} | Address: {address}\n")
 
 def main():
     if not os.path.isfile(RICHLIST_FILE):
@@ -56,25 +70,29 @@ def main():
         sys.exit(1)
 
     print(f"\n[INFO] Starting random key scan using {num_processes} processes...")
-
     pool = Pool(processes=num_processes)
-    last_report = time.time()
     total_checked = 0
     matches_found = 0
+    last_report = time.time()
+    start_time = last_report
 
     try:
         while True:
-            results = pool.map(worker, [(bloom, richlist_set)] * num_processes)
-            for result in results:
-                total_checked += 1
-                if result is not None:
-                    priv_key_int, addr = result
-                    print(f"[MATCH] Private Key: {priv_key_int} | Address: {addr}")
-                    matches_found += 1
+            results = pool.imap_unordered(worker, [(bloom, richlist_set)] * num_processes)
+            for result_batch in results:
+                total_checked += CHUNK_SIZE
+                elapsed = time.time() - start_time
+                hash_rate = total_checked / elapsed if elapsed > 0 else 0
 
-            if time.time() - last_report >= 60:
-                print(f"[INFO] Checked: {total_checked:,} keys so far...")
-                last_report = time.time()
+                if result_batch:
+                    for priv_key_int, addr in result_batch:
+                        print(f"[MATCH] Private Key: {priv_key_int} | Address: {addr}")
+                        log_match_to_file(priv_key_int, addr)
+                        matches_found += 1
+
+                if time.time() - last_report >= 5:
+                    print(f"[INFO] Checked: {total_checked:,} keys | Matches: {matches_found} | Hashrate: {hash_rate:,.2f} keys/sec")
+                    last_report = time.time()
     except KeyboardInterrupt:
         print("\n[STOPPED] Scanning interrupted by user.")
         pool.terminate()
